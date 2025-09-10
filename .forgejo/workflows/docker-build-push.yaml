@@ -1,0 +1,42 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*'         # Триггер при любом изменении репозитория
+
+jobs:
+  build-and-push:
+    runs-on: docker
+
+    container:
+      image: docker:24.0.1
+
+    steps:
+      # Установка Docker CLI (если не в базовом образе)
+      - name: Setup Docker CLI
+        run: |
+          apk add --no-cache docker-cli
+
+      # Авторизация в Docker Hub - токен необходимо добавить в Secrets
+      - name: Login to Docker Hub
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+
+      # Клонирование исходников — встроено в Forgejo Actions
+
+      # Сборка Docker образа
+      - name: Build Docker Image
+        run: |
+          docker build -t ${DOCKER_USERNAME}/playwright-domain-scanner:latest .
+
+      # Push образ на Docker Hub
+      - name: Push Docker Image
+        run: |
+          docker push ${DOCKER_USERNAME}/playwright-domain-scanner:latest
+
