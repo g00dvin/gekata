@@ -1,25 +1,48 @@
-FROM node:20-trixie-slim
+# Base minimal Debian
+FROM debian:bookworm-slim
 
+# Prevent tzdata prompts
 ENV DEBIAN_FRONTEND=noninteractive
-WORKDIR /usr/src/app
 
-# Базовые утилиты, без лишних рекоммендованных пакетов
+# Install Node.js, Chromium and minimal runtime libs
+# Note: chromium package on Debian provides /usr/bin/chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg && \
-    rm -rf /var/lib/apt/lists/*
+    ca-certificates curl gnupg \
+    nodejs npm \
+    chromium \
+    # Minimal GUI/Chromium runtime libs often needed by Playwright Chromium
+    libx11-6 libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 \
+    libgtk-3-0 libnss3 libdrm2 libgbm1 libasound2 fonts-liberation \
+    # Useful for font rendering
+    fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/*
 
+# App directory
+WORKDIR /app
+
+# Install only production deps
 COPY package*.json ./
+ENV CI=true
 RUN npm ci --omit=dev
 
-# Ставим только headless shell Chromium и его системные зависимости
-RUN npx playwright install --with-deps --only-shell && \
-    rm -rf /usr/share/doc /usr/share/man /var/cache/apt/*
+# Copy source
+COPY . .
 
-# Копируем минимально нужные исходники
-COPY server.js ./
-# Если используется игнор-лист как файл — раскомментируйте строку:
-COPY ignore-domains.txt ./
+# Security: run as non-root
+RUN useradd -ms /bin/bash nodeuser && chown -R nodeuser:nodeuser /app
+USER nodeuser
 
+# Environment for service
+ENV PORT=3000 \
+    # Ensure Playwright uses system Chromium and does not download browsers
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    PLAYWRIGHT_BROWSERS_PATH=0 \
+    # Explicit executable if needed in code; here server uses default, so optional
+    CHROMIUM_PATH=/usr/bin/chromium
+
+# Expose service port
 EXPOSE 3000
+
+# Start the service
 CMD ["node", "server.js"]
 
