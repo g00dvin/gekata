@@ -1,5 +1,5 @@
 {
-  "name": "playwright-domain-scanner",
+  "name": "gekata",
   "version": "1.0.0",
   "description": "Service to find all domains loaded by webpage using Playwright",
   "main": "server.js",
@@ -8,7 +8,8 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "playwright": "^1.42.0"
+    "playwright": "^1.42.0",
+    "better-sqlite3": "^9.0.0"
   }
 }
 
