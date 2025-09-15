@@ -2,14 +2,15 @@
 const express = require('express');
 const { chromium } = require('playwright');
 const Database = require('better-sqlite3');
-const punycode = require('punycode/');
+// Убираем punycode; используем WHATWG URL + domainToASCII
+const { URL, domainToASCII } = require('node:url');
+
 const app = express();
 
 // ---------- Config ----------
 const PORT = Number(process.env.PORT || 3000);
 const CHROMIUM_PATH = process.env.CHROMIUM_PATH || undefined;
 const CACHE_TTL_SECONDS = parseInt(process.env.CACHE_TTL_SECONDS || '21600', 10);
-// Важно: это реальный лимит редиректов для документной навигации
 const MAX_REDIRECT_STEPS = parseInt(process.env.MAX_REDIRECT_STEPS || '20', 10);
 const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '30000', 10);
 const QUIET_WINDOW_MS = parseInt(process.env.QUIET_WINDOW_MS || '700', 10);
@@ -68,12 +69,22 @@ function normalizeDomain(input) {
   if (!input || typeof input !== 'string') return null;
   const s = input.trim().toLowerCase();
   try {
-    const u = new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`);
-    return punycode.toASCII(u.hostname) || null;
+    // Если это URL, берём hostname; иначе считаем, что это просто хост
+    const asUrl = /^https?:\/\//i.test(s) ? s : `https://${s}`;
+    const u = new URL(asUrl);
+    // Преобразуем к IDNA ASCII (Punycode) через WHATWG util
+    const ascii = domainToASCII(u.hostname || '');
+    return ascii || null;
   } catch {
-    try { return punycode.toASCII(s) || null; } catch { return null; }
+    // Попытка прямой IDNA-конверсии из строки (на случай голого хоста без схемы)
+    try {
+      const ascii = domainToASCII(s);
+      return ascii || null;
+    } catch {
+      return null;
+    }
   }
-} // [Express/Node JSON response patterns] [4]
+} // WHATWG URL + url.domainToASCII [web:167][web:161][web:164]
 
 function extractDomain(url) {
   try { return new URL(url).hostname.toLowerCase(); } catch { return null; }
@@ -148,7 +159,7 @@ async function precheckFollowManually(startUrl) {
   }
   log.debug(`[PRECHECK] Too many redirects >= ${PRECHECK_MAX_REDIRECTS}`);
   return { skip: true, reason: `redirect-loop(${PRECHECK_MAX_REDIRECTS})`, tryBrowser: sawHtmlHint, finalUrl: null };
-} // [Navigations & heuristics / handling redirects] [4]
+} // [web:167]
 
 // ---------- Browser lifecycle ----------
 let browser;
@@ -158,12 +169,11 @@ async function ensureBrowser() {
   log.info(`[BROWSER] Launch headless Chromium`);
   browser = await chromium.launch({ executablePath: CHROMIUM_PATH, headless: true, args: CHROMIUM_ARGS });
   return browser;
-} // [Playwright best practices] [13]
+} // [web:151]
 
 // ---------- Redirect chain builder (document-only) ----------
 function buildRedirectChainForResponse(resp, maxLen = 50) {
   const chain = [];
-  // Учитываем цепочку только для документной навигации
   const req = resp.request();
   if (req.resourceType() !== 'document') return chain;
   let prev = req.redirectedFrom();
@@ -176,7 +186,7 @@ function buildRedirectChainForResponse(resp, maxLen = 50) {
     if (chain.length >= maxLen) break;
   }
   return chain.reverse();
-} // [Playwright Request.redirectedFrom usage] [12]
+} // [web:151]
 
 // ---------- Quiet network window ----------
 async function quietWindowWait({ inflightRef, lastChangeRef, timeoutMs, quietMs }) {
@@ -186,34 +196,49 @@ async function quietWindowWait({ inflightRef, lastChangeRef, timeoutMs, quietMs 
     if (inflightRef.value === 0 && quietFor >= quietMs) return;
     await new Promise(r => setTimeout(r, 100));
   }
-} // [Wait strategy guidance] [14]
+} // [web:151]
 
 // ---------- Core scan with Playwright ----------
 async function scanWithBrowser(originDomain, startUrl, contextOpts = {}) {
   const b = await ensureBrowser();
   const context = await b.newContext({ acceptDownloads: true, ...contextOpts });
 
-  // Глобальный лимитер редиректов для документных навигаций:
-  // - для isNavigationRequest() с resourceType 'document' используем route.fetch({ maxRedirects })
-  // - ассеты пропускаем без ограничения, чтобы не ломать рендер
+  // Безопасный лимитер редиректов для документной навигации
   await context.route('**', async route => {
     const request = route.request();
     const isDoc = request.resourceType() === 'document';
     const isNav = request.isNavigationRequest();
-    if (isDoc && isNav) {
+    if (!(isDoc && isNav)) return route.continue();
+    try {
+      const resp = await route.fetch({ maxRedirects: MAX_REDIRECT_STEPS });
+      const status = resp.status();
+      const headers = await resp.headers();
+      const body = await resp.body().catch(() => null);
       try {
-        const response = await route.fetch({ maxRedirects: MAX_REDIRECT_STEPS });
-        return route.fulfill({ response });
+        await route.fulfill({ status, headers, body });
       } catch (e) {
-        // Если maxRedirects сработал, прерываем навигацию «аккуратно»
-        return route.fulfill({
-          status: 508,
-          body: 'Loop Detected: too many redirects'
-        });
+        log.debug(`[ROUTE] fulfill failed for ${request.url()}: ${e?.message || e}`);
+        await route.continue();
+      }
+    } catch (e) {
+      const msg = String(e?.message || '');
+      if (/redirect/i.test(msg) || /too many/i.test(msg)) {
+        try {
+          await route.fulfill({
+            status: 508,
+            contentType: 'text/plain',
+            body: 'Loop Detected: too many redirects'
+          });
+        } catch (e2) {
+          log.debug(`[ROUTE] fulfill(508) failed for ${request.url()}: ${e2?.message || e2}`);
+          await route.continue();
+        }
+      } else {
+        log.debug(`[ROUTE] fetch failed for ${request.url()}: ${msg}`);
+        await route.continue();
       }
     }
-    return route.continue();
-  }); // [Limit redirects for page.goto via routing] [4][5]
+  });
 
   const page = await context.newPage();
 
@@ -227,12 +252,12 @@ async function scanWithBrowser(originDomain, startUrl, contextOpts = {}) {
     page.on('console', msg => log.debug(`[PAGE.CONSOLE] ${msg.type()}: ${msg.text()}`));
     page.on('pageerror', err => log.debug(`[PAGE.ERROR] ${err?.message}`));
     page.on('requestfailed', req => log.debug(`[REQ.FAIL] ${req.url()} reason=${req.failure()?.errorText}`));
-  } // [Console/request monitoring] [13]
+  }
 
   page.on('download', async dl => {
     try { await dl.failure().catch(() => {}); } catch {}
     log.debug(`[SCAN] Download ignored: ${dl.url()}`);
-  }); // [Downloads handling] [13]
+  });
 
   const onReq = req => {
     inflightRef.value++;
@@ -248,7 +273,6 @@ async function scanWithBrowser(originDomain, startUrl, contextOpts = {}) {
     if (d) seenDomains.add(d);
     const status = resp.status();
     log.debug(`[RESP] ${status} ${resp.url()}`);
-    // только документные редиректы считаем в цепочку
     if (status >= 300 && status < 400 && resp.request().resourceType() === 'document') {
       const piece = buildRedirectChainForResponse(resp, MAX_REDIRECT_STEPS + 5);
       redirectLog.push(...piece);
@@ -271,8 +295,7 @@ async function scanWithBrowser(originDomain, startUrl, contextOpts = {}) {
       }
     }
 
-    // Если наш «ограничитель» вернул 508 — считаем как превышение редиректов
-    if (response && response.status() === 508) {
+    if (response && response.status && response.status() === 508) {
       throw new Error(`Too many redirects (${MAX_REDIRECT_STEPS})`);
     }
 
@@ -282,7 +305,6 @@ async function scanWithBrowser(originDomain, startUrl, contextOpts = {}) {
     if (visitedUrls.has(finalUrl)) throw new Error('Redirect loop detected');
     visitedUrls.add(finalUrl);
 
-    // Проверка цепочки только по документам
     const steps = redirectLog.length;
     if (steps > MAX_REDIRECT_STEPS) throw new Error(`Too many redirects (${steps})`);
 
